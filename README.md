@@ -7,8 +7,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
-Create a `.env` file with your own API key: 
-    GTFS_RT_API_KEY = ##
+Create a `.env` file with the API key: 
+    GTFS_RT_API_KEY = api_key_here
 
 ## Scripts
 ```
@@ -20,10 +20,10 @@ dw-dl-swiss-transport/
 │   └── processing/
 │       └── canton_join.py          # assigns canton to lat/lon points (needs swissBOUNDARIES3D)
 ├── data/
-│   └── raw/            (gitignored — don't commit pulled data)
+│   └── raw/            (gitignored — raw pulled data is excluded from git)
 ├── notebooks/          (optional, for exploration/testing)
 ├── requirements.txt
-├── .env                (gitignored — your own API key, never commit this)
+├── .env                (gitignored — contains the API key and is excluded from git for security)
 ├── README.md
 └── .gitignore
 ```
@@ -31,7 +31,7 @@ dw-dl-swiss-transport/
 ## Running the ingestion scripts
 
 **GTFS-RT** (needs an API key):
-1. Add the GTFS-RT API key to `.env`: `GTFS_RT_API_KEY=your_key_here`
+1. Add the GTFS-RT API key to `.env`: `GTFS_RT_API_KEY=api_key_here`
 2. Run: `python3 src/ingestion/gtfs_rt_ingest.py`
 3. Saves a `.pb` snapshot to `data/raw/gtfs_rt/`
 
