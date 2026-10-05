@@ -11,6 +11,7 @@ Create a `.env` file with your own API key:
     GTFS_RT_API_KEY = ##
 
 ## Scripts
+```
 dw-dl-swiss-transport/
 ├── src/
 │   ├── ingestion/
@@ -25,7 +26,7 @@ dw-dl-swiss-transport/
 ├── .env                (gitignored — your own API key, never commit this)
 ├── README.md
 └── .gitignore
-
+```
 
 ## Running the ingestion scripts
 
