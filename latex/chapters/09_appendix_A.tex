@@ -1,0 +1,173 @@
+% !TEX root = ../main.tex
+\cleardoublepage%
+\refstepcounter{chapter}%
+\phantomsection
+\chapter[Appendix A - If Needed]{\label{chap:apx_exp_data}Appendix  - if Needed\chaptermark{Appendix A}}%
+\chaptermark{Appendix A}%
+  
+The first appendix is here. The purpose of appendices is to keep the main part of the document clear and readable. There can be many appendices, everyone should form an integral part. The following should be considered as the candidates to build appendices:
+
+\begin{tight_itemize}
+    \item Multi-page tables disturbing the reading with important information which you want to include in your manuscript;
+    \item detailed schematics for which you provided a simplified version in text (you can refer to the more complex scheme in an Appendix and only show the simplified scheme inside the main text).
+    \item important pieces of code allowing for validation of the results. Most of the code will probably go to the git repository anyway.
+    \item multiple figures of some properties, showing that the solution described in the manuscript is capable of calculating the properties shown in an Appendix, but the values in figures do not have the crucial significance for the research/engineering plot line of your manuscript.
+\end{tight_itemize}
+
+\chapter[Appendix - Project Evaluation Grid ]{\label{chap:apx_b}Appendix  - Project Evaluation Grid\chaptermark{Appendix B}}%
+\chaptermark{Appendix B}%
+  
+\begin{table}[htbp]
+\centering
+\caption{Final Report Evaluation Grid}
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{6pt}
+\scriptsize
+
+% Column types
+\newcolumntype{L}{>{\raggedright\arraybackslash}p{0.4\textwidth}}
+\newcolumntype{P}{>{\centering\arraybackslash}p{0.10\textwidth}}
+\newcolumntype{C}{>{\centering\arraybackslash}p{0.10\textwidth}}
+
+\begin{tabular}{|L|P|C|C|C|}
+\hline
+\textbf{Evaluation Criteria} & \textbf{Maximum possible points} & \textbf{Student 1} & \textbf{Student 2} & \textbf{Student 3}\\
+\hline
+
+\rowcolor{gray!25}
+\textbf{1.\ \ Introduction} & \textbf{5} &  &  &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Topic introduction
+  \item Motivation
+  \item Problem definition \& Goals
+  \item Business/Research questions
+  \item Business intelligence questions
+\end{itemize}\vspace{2pt}
+\end{minipage}
+&  &  & X &  \\
+\hline
+
+\rowcolor{gray!25}
+\textbf{2.\ \ Data Lake} & \textbf{5} &  &  &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Data Assumptions
+  \item Architecture
+\end{itemize}\vspace{2pt}
+\end{minipage}
+&  & X &  &  \\
+\hline
+
+\rowcolor{gray!25}
+\textbf{3.\ \ Data Ingestion (Data Lake \& Data Warehouse)} & \textbf{5} &  &  &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Data Source Documentation (dynamic/static, API details, justification)
+  \item Pipeline Design (batch/streaming, workflow diagram, tools)
+  \item Data Capture \& Handling (schema evolution, error handling, duplicates)
+\end{itemize}\vspace{2pt}
+\end{minipage}
+&  &  & X &  \\
+\hline
+
+\rowcolor{gray!25}
+\textbf{4.\ \ Data Storage} & \textbf{5} &  &  &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Storage Layers \& Services (zones, technologies)
+  \item Data Formats \& Optimization (formats, partitioning, compression)
+  \item Database Design (ER diagrams, indexing, retrieval)
+\end{itemize}\vspace{2pt}
+\end{minipage}
+&  & X &  &  \\
+\hline
+
+\rowcolor{gray!25}
+\textbf{5.\ \ Data Transformation (Data Lake \& Data Warehouse)} & \textbf{5} &  &  &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Transformation Logic (joins, aggregations, enrichment)
+  \item Data Cleaning \& Preparation (missing values, assumptions)
+  \item Data Quality \& Validation
+  \item Scalability \& Reusability (modular, reusable pipelines)
+\end{itemize}\vspace{2pt}
+\end{minipage}
+&  & X & X &  \\
+\hline
+
+\rowcolor{gray!25}
+\textbf{6.\ \ Data Warehouse} & \textbf{5} &  &  &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Define business goals and objectives
+  \item Data modeling approach
+  \item Architecture
+  \item Data preparation
+\end{itemize}\vspace{2pt}
+\end{minipage}
+&  &  & X &  \\
+\hline
+
+\rowcolor{gray!25}
+\textbf{7.\ \ Data Visualization} & \textbf{5} &  &  &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Visualization purpose
+  \item Theoretical model
+  \item Data Warehouse visualizations
+  \item Answer business questions
+\end{itemize}\vspace{2pt}
+\end{minipage}
+&  &  & X &  \\
+\hline
+
+\rowcolor{gray!25}
+\textbf{8.\ \ Conclusions} & \textbf{5} &  & X &  \\
+\hline
+\begin{minipage}[t]{\linewidth}\vspace{2pt}
+\begin{itemize}[leftmargin=1.2em, nosep]
+  \item Discussion of the solution
+  \item Discussions of the project outcomes
+  \item Future work
+  \item GenAI Declaration
+\end{itemize}\vspace{2pt}
+\end{minipage}
+& \textbf{5} & X & X & X \\
+\hline
+
+\end{tabular}
+\end{table}
+
+
+
+
+\chapter[Appendix - Project Code Leads ]{\label{chap:apx_c}Appendix  - Project Code Leads\chaptermark{Appendix C}}%
+\chaptermark{Appendix C}%
+  
+\begin{table}[h]
+\centering
+\caption{Code Project Leads}
+\renewcommand{\arraystretch}{1.2}
+
+\begin{tabular}{|p{8cm}|c|c|c|}
+\hline
+\textbf{Responsibilities} & \textbf{Student 1} & \textbf{Student 2} & \textbf{Student 3} \\
+\hline
+API Data Source 1 (Ingestion) & X & & \\
+API Data Source 2 (Ingestion) & & X & \\
+Additional Data Sources (Ingestion) & & & X \\
+Databases or S3 services & X & X & X \\
+Any other scripts & X & X & \\
+Jupyter Notebooks (Pipeline - Design) & & X & \\
+... & & X & \\
+\hline
+\end{tabular}
+\end{table}

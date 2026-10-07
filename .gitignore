@@ -5,3 +5,15 @@ __pycache__/
 data/
 .DS_Store
 .ipynb_checkpoints/
+# LaTeX build files
+latex/**/*.aux
+latex/**/*.log
+latex/**/*.out
+latex/**/*.toc
+latex/**/*.bbl
+latex/**/*.blg
+latex/**/*.fdb_latexmk
+latex/**/*.fls
+latex/**/*.synctex.gz
+latex/main.pdf
+*.bak

@@ -1,0 +1,30 @@
+% !TEX root = ../main.tex
+\cleardoublepage%
+\chapter{\label{chap:di}Data Ingestion}%
+
+\section{\label{sec:di_ds}Data Source Documentation}
+
+\begin{itemize}
+\item Clear identification of each source (dynamic vs static).
+\item API details: authentication, rate limits, pagination handling, endpoints.
+\item Justification of why the source supports the use case.
+
+\end{itemize}
+
+\section{\label{sec:di_etl}Pipeline Design}
+\begin{itemize}
+    \item Architecture of the ingestion process (batch, hybrid).
+\item Tools/technologies used (e.g., Glue, Lambda, etc).
+\item Diagrams representing the ingestion workflow.
+
+\end{itemize}
+
+\section{\label{sec:di_etl}Data Capture \& Handling}
+\begin{itemize}
+
+\item Handling of schema evolution (e.g., column changes).
+\item Strategies for retries, error handling, and logging.
+\item Management of duplicates or late-arriving data.
+
+
+\end{itemize}
