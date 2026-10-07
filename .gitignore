@@ -15,5 +15,8 @@ latex/**/*.blg
 latex/**/*.fdb_latexmk
 latex/**/*.fls
 latex/**/*.synctex.gz
-latex/main.pdf
+latex/**/*.bcf
+latex/**/*.run.xml
+latex/**/*.lof
+latex/**/*.lot
 *.bak
