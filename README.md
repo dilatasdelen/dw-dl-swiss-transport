@@ -21,6 +21,7 @@ dw-dl-swiss-transport/
 │       └── canton_join.py          # assigns canton to lat/lon points (needs swissBOUNDARIES3D)
 ├── data/
 │   └── raw/            (gitignored — raw pulled data is excluded from git)
+│        ├── stops.txt
 ├── notebooks/          (optional, for exploration/testing)
 ├── requirements.txt
 ├── .env                (gitignored — contains the API key and is excluded from git for security)
