@@ -7,4 +7,3 @@ geopandas
 boto3
 pyarrow
 pyogrio
-pytest
