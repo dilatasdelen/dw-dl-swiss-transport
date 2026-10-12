@@ -42,5 +42,34 @@ dw-dl-swiss-transport/
 
 Each run creates a new timestamped file, so running them repeatedly over time builds up the raw data collection (not a one-off pull).
 
+## Building the versioned stop-to-canton reference
+
+The canton reference job downloads and preserves the official
+swissBOUNDARIES3D GeoPackage, reads `stops.txt` directly from a versioned GTFS
+Static ZIP, transforms WGS84 stop coordinates to the polygon CRS, and assigns
+each stop with an auditable point-in-polygon join.
+
+```bash
+python -m src.processing.canton_join \
+  --gtfs-zip data/raw/gtfs_static/feed_version=20261010/GTFS_FP2026_20261010.zip \
+  --feed-version 20261010 \
+  --boundary-release 2026-01
+```
+
+Generated outputs are gitignored and written to:
+
+```text
+data/raw/swissboundaries3d/release=2026-01/
+data/reference/gtfs_static_stops/feed_version=20261010/part-00000.parquet
+data/quality/canton_assignment/feed_version=20261010/summary.json
+```
+
+Join this reference to version-matched GTFS-RT rows with `feed_version` and
+`static_stop_id = stop_id`. Retain all join statuses for quality reporting and
+filter on `in_study_area` only in the analytical stage.
+
+The verified `20261010` reference-run results are documented in
+`docs/canton_join_validation_20261010.md`.
+
 ## Authors
 Dila Tasdelen, Ji Hyeon Choung, Sediqullah Kismat Khan

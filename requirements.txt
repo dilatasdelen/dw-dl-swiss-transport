@@ -5,3 +5,6 @@ pandas
 shapely
 geopandas
 boto3
+pyarrow
+pyogrio
+pytest
