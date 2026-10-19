@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 import requests
@@ -5,40 +6,47 @@ import pandas as pd
 from datetime import datetime, timezone
 
 API_URL = "https://api.open-meteo.com/v1/elevation"
-STOPS_PATH = "data/raw/stops.txt"
 OUTPUT_PATH = "data/raw/elevation/station_elevation.csv"
 
 BATCH_SIZE = 100
 
 PAUSE_SECONDS = 80
 
-# Rough bounding box around ZH, ZG, LU and SZ, so we don't request elevation
-# for all of Switzerland. The exact canton filter is done later in canton_join.py
-BBOX = {"lat_min": 46.75, "lat_max": 47.70, "lon_min": 7.83, "lon_max": 9.03}
+# Reuse the point-in-polygon result from canton_join.py. The reference must
+# contain one explicit GTFS Static version, not a directory of mixed versions.
+CACHE_KEYS = [
+    "didok", "parent_stop_id", "lat", "lon", "feed_version",
+    "boundary_release", "boundary_crs", "study_canton_code",
+]
 
 
-def load_stations(stops_path=STOPS_PATH):
-    # stops.txt starts with a byte order mark, so utf-8-sig keeps "stop_id" readable
-    stops = pd.read_csv(stops_path, dtype={"didok": str}, encoding="utf-8-sig")
+def load_stations(canton_reference_path):
+    """Load study-area parent stations from one polygon-assigned reference."""
+    stops = pd.read_parquet(canton_reference_path)
+    versions = stops["feed_version"]
+    if versions.isna().any() or versions.nunique() != 1:
+        raise ValueError("Select a canton reference containing exactly one feed_version.")
 
-    # Every platform points to a parent station row (location_type = 1) with the
-    # same didok number, so the parent rows are already one row per physical station, so we keep the rows,
-    # which only has the location_type = 1, meaning a main station without any platforms
-    stations = stops[stops["location_type"] == 1]
-    stations = stations[["didok", "stop_id", "stop_name", "stop_lat", "stop_lon"]].rename(columns={
+    selected = (
+        pd.to_numeric(stops["location_type"], errors="coerce").eq(1)
+        & stops["canton_join_status"].eq("matched")
+        & stops["in_study_area"].eq(True)
+    )
+    stations = stops.loc[selected, [
+        "didok", "stop_id", "stop_name", "stop_lat", "stop_lon",
+        "feed_version", "boundary_release", "boundary_crs", "study_canton_code",
+    ]].rename(columns={
         "stop_id": "parent_stop_id",
         "stop_name": "station_name",
         "stop_lat": "lat",
         "stop_lon": "lon",
     })
 
-    # limiting it to Zurich, Zug, Luzern and Schwyz
-    in_bbox = (
-        stations["lat"].between(BBOX["lat_min"], BBOX["lat_max"])
-        & stations["lon"].between(BBOX["lon_min"], BBOX["lon_max"])
-    )
-    
-    return stations[in_bbox].reset_index(drop=True)
+    if stations["didok"].isna().any():
+        raise ValueError("Selected parent stations have missing didok identifiers.")
+    for column in ("didok", "feed_version", "boundary_release"):
+        stations[column] = stations[column].astype(str)
+    return stations.reset_index(drop=True)
 
 
 def fetch_elevation(lats, lons, max_retries=3):
@@ -67,17 +75,34 @@ def fetch_elevation(lats, lons, max_retries=3):
         return response.json()["elevation"]
 
 
-def fetch_station_elevation(stops_path=STOPS_PATH, output_path=OUTPUT_PATH):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    stations = load_stations(stops_path)
+def fetch_station_elevation(canton_reference_path, output_path=OUTPUT_PATH):
+    stations = load_stations(canton_reference_path)
 
     # If an earlier run stopped halfway, skip the stations that are already saved
     if os.path.exists(output_path):
-        done = pd.read_csv(output_path, dtype={"didok": str})["didok"]
+        cached = pd.read_csv(output_path, dtype={
+            "didok": str, "feed_version": str, "boundary_release": str,
+        }, float_precision="round_trip")
+        if not set(CACHE_KEYS).issubset(cached.columns):
+            raise ValueError(
+                "Existing elevation CSV predates the polygon reference. "
+                "Preserve it separately and rebuild the default station list."
+            )
+        matches = cached.merge(
+            stations[CACHE_KEYS], on=CACHE_KEYS, how="left",
+            indicator=True, validate="many_to_one",
+        )
+        if not matches["_merge"].eq("both").all():
+            raise ValueError(
+                "Existing elevation CSV does not match this polygon reference "
+                "and its station coordinates. Preserve it separately and rebuild."
+            )
+        done = cached["didok"]
         stations = stations[~stations["didok"].isin(done)].reset_index(drop=True)
         print(f"{len(done)} stations already saved, {len(stations)} left")
 
     print(f"Requesting elevation for {len(stations)} stations...")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     for start in range(0, len(stations), BATCH_SIZE):
         batch = stations.iloc[start:start + BATCH_SIZE].copy()
@@ -97,4 +122,11 @@ def fetch_station_elevation(stops_path=STOPS_PATH, output_path=OUTPUT_PATH):
 
 
 if __name__ == "__main__":
-    fetch_station_elevation()
+    parser = argparse.ArgumentParser(
+        description="Collect station elevation using the polygon-filtered study area."
+    )
+    parser.add_argument("--canton-reference", required=True,
+                        help="Parquet file for one GTFS Static feed_version.")
+    parser.add_argument("--output-path", default=OUTPUT_PATH)
+    args = parser.parse_args()
+    fetch_station_elevation(args.canton_reference, args.output_path)
