@@ -1,0 +1,73 @@
+{
+  "run_id": "hour-20261012-20",
+  "ingest_date": "2026-10-12",
+  "ingest_hour": "20",
+  "feed_version": "20261010",
+  "input_scope": "whole_hour",
+  "input_files": 60,
+  "input_compressed_bytes": 117840591,
+  "observed_feed_versions": [
+    "20261010"
+  ],
+  "counts": {
+    "staging": 9659781,
+    "canton_classified": 9659781,
+    "study_rows": 3668581,
+    "static_relevant": 56633,
+    "matched": 3668581,
+    "prediction_history": 3668581
+  },
+  "stage_materialization_seconds": {
+    "staging": 172.877,
+    "canton_classified": 68.34,
+    "study_rows": 29.24,
+    "static_relevant": 9.354,
+    "matched": 37.82,
+    "prediction_history": 96.425
+  },
+  "area_counts": [
+    {
+      "area_status": "eligible",
+      "count": 3668581
+    },
+    {
+      "area_status": "outside_study_area",
+      "count": 5846818
+    },
+    {
+      "area_status": "non_delay_event",
+      "count": 60
+    },
+    {
+      "area_status": "unknown_stop",
+      "count": 10545
+    },
+    {
+      "area_status": "unknown_canton",
+      "count": 133777
+    }
+  ],
+  "static_match_counts": [
+    {
+      "static_match_status": "matched",
+      "static_match_reason": null,
+      "count": 3637156
+    },
+    {
+      "static_match_status": "unmatched",
+      "static_match_reason": "added_trip_not_in_static",
+      "count": 31425
+    }
+  ],
+  "missing_delay_rows": 27269,
+  "zero_delay_rows": 375219,
+  "deduplicated_rows": 0,
+  "stop_reference": "s3://datavault-v1/reference/gtfs_static_stops/feed_version=20261010/",
+  "static_reference": "s3://datavault-v1/reference/gtfs_static_stop_times/feed_version=20261010/",
+  "deduplication_scope": "selected input files only",
+  "deduplication_rule": "identical complete prediction content including feed_timestamp",
+  "final_published_prediction_selected": false,
+  "warnings": [],
+  "total_job_script_seconds": 522.137,
+  "status": "success"
+}
