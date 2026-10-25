@@ -1,0 +1,65 @@
+{
+  "run_id": "events-20261012-20-v1-2",
+  "input_run_ids": [
+    "hour-20261012-20"
+  ],
+  "selection_window": {
+    "start_utc": "2026-10-12T20:00:00Z",
+    "end_utc_exclusive": "2026-10-12T21:00:00Z"
+  },
+  "selection_rule_version": "pilot_latest_valid_feed_v1",
+  "selection_status": "latest_valid_in_selected_window",
+  "window_time_basis": "feed_timestamp; start inclusive, end exclusive",
+  "final_published_prediction_selected": false,
+  "counts": {
+    "history_input": 3668581,
+    "history_unique": 3668581,
+    "observations": 3668581,
+    "eligible": 3623779,
+    "blocked_events": 0,
+    "timeline": 3623779,
+    "event_candidates_base": 93556,
+    "selected_capture_lineage": 93556
+  },
+  "stage_materialization_seconds": {
+    "history_input": 79.194,
+    "history_unique": 59.672,
+    "observations": 32.917,
+    "eligible": 32.146,
+    "blocked_events": 10.75,
+    "timeline": 44.743,
+    "event_candidates_base": 36.758,
+    "selected_capture_lineage": 11.787
+  },
+  "replayed_history_rows_removed": 0,
+  "valid_observation_rows_collapsed_to_events": 3530223,
+  "selection_reasons": [
+    {
+      "selection_reason": "eligible",
+      "count": 3623779
+    },
+    {
+      "selection_reason": "missing_published_delay",
+      "count": 1205
+    },
+    {
+      "selection_reason": "no_valid_static_match",
+      "count": 31425
+    },
+    {
+      "selection_reason": "unavailable_stop_prediction",
+      "count": 12172
+    }
+  ],
+  "blocked_event_count": 0,
+  "selected_zero_delay_events": 6447,
+  "selected_events_with_newer_invalid_observations": 121,
+  "events_with_prediction_revisions": 42667,
+  "source_scope": "only explicitly supplied successful job-1 runs",
+  "silver_history_modified": false,
+  "warnings": [
+    "Provisional selection. Journey-wide finalisation and observation-window completeness are not certified."
+  ],
+  "total_job_script_seconds": 378.352,
+  "status": "success"
+}
