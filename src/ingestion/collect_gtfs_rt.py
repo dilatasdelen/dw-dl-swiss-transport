@@ -24,7 +24,7 @@ from google.transit import gtfs_realtime_pb2
 s3 = boto3.client("s3")
 secrets_manager = boto3.client("secretsmanager")
 
-RAW_BUCKET = os.environ["RAW_BUCKET"]
+RAW_BUCKET = os.environ.get("RAW_BUCKET", "datavault-v2")
 API_SECRET_NAME = os.environ["API_SECRET_NAME"]
 GTFS_RT_URL = os.environ["GTFS_RT_URL"]
 USER_AGENT = os.environ["USER_AGENT"]
@@ -149,7 +149,7 @@ def lambda_handler(event, context):
         payload_hash = hashlib.sha256(payload).hexdigest()
         timestamp = received_at.strftime("%Y%m%dT%H%M%S%fZ")
         raw_key = (
-            f"{make_prefix('raw', received_at)}/"
+            f"{make_prefix('bronze', received_at)}/"
             f"{timestamp}_{payload_hash}.pb"
         )
 

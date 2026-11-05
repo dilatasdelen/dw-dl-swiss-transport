@@ -33,7 +33,7 @@ PREDICTION_COLUMNS = [c for c in STAGING_COLUMNS if c not in CAPTURE_FIELDS]
 
 
 def experiment_paths(bucket, ingest_date, ingest_hour, run_id):
-    """Keep all writes in an isolated, explicitly named experiment prefix."""
+    """Read one decoded Silver partition and preserve a separate output run."""
     if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
         raise ValueError("Invalid DATA_BUCKET")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", ingest_date):
@@ -44,9 +44,9 @@ def experiment_paths(bucket, ingest_date, ingest_hour, run_id):
         raise ValueError("INGEST_HOUR must be between 0 and 23")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", run_id):
         raise ValueError("RUN_ID must be a simple label, not an S3 path")
-    root = f"s3://{bucket}/experiments/staging_silver_pilot/run_id={run_id}/"
+    root = f"s3://{bucket}/silver/gtfs_rt_processed/run_id={run_id}/"
     staging = (
-        f"staging/gtfs_rt_prediction_snapshot/"
+        f"silver/gtfs_rt_decoded/"
         f"ingest_date={ingest_date}/hour={hour:02d}/"
     )
     return staging, root
@@ -283,8 +283,8 @@ def main():
     if version not in observed_versions:
         raise ValueError(f"FEED_VERSION {version} not present. Observed: {observed_versions}")
 
-    stop_path = f"s3://{bucket}/reference/gtfs_static_stops/feed_version={version}/"
-    static_path = f"s3://{bucket}/reference/gtfs_static_stop_times/feed_version={version}/"
+    stop_path = f"s3://{bucket}/silver/reference/gtfs_static_stops/feed_version={version}/"
+    static_path = f"s3://{bucket}/silver/reference/gtfs_static_stop_times/feed_version={version}/"
     stop_columns = ["stop_id", "stop_name", "didok", "stop_lat", "stop_lon",
                     "study_canton_code", "canton_join_status", "in_study_area",
                     "feed_version", "boundary_release", "boundary_crs"]

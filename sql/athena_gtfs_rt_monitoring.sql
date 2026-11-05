@@ -3,11 +3,11 @@
 -- Prerequisites
 -- -------------
 -- The collector must write one audit JSON object per collection attempt:
---   s3://<PROJECT_BUCKET>/audit/gtfs_rt/
+--   s3://datavault-v2/audit/gtfs_rt/
 --       ingest_date=YYYY-MM-DD/hour=HH/*.json
 --
 -- The decoder must write one quality JSON object per raw snapshot:
---   s3://<PROJECT_BUCKET>/quality/gtfs_rt_snapshot_decode/
+--   s3://datavault-v2/quality/gtfs_rt_snapshot_decode/
 --       ingest_date=YYYY-MM-DD/hour=HH/*.json
 --
 -- Required collector fields:
@@ -19,8 +19,8 @@
 --   trip_update_entity_count, stop_time_update_count, missing_delay_count,
 --   zero_delay_count
 --
--- Before running the external-table DDL, replace every <PROJECT_BUCKET>
--- placeholder with the actual S3 bucket name. Run each CREATE DATABASE,
+-- Storage target: datavault-v2. Audit and quality remain operational prefixes
+-- outside Bronze/Silver/Gold. Run each CREATE DATABASE,
 -- CREATE TABLE, CREATE VIEW, SHOW, and SELECT statement separately in the
 -- Athena Query Editor.
 --
@@ -58,7 +58,7 @@ PARTITIONED BY (
     hour string
 )
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://<PROJECT_BUCKET>/audit/gtfs_rt/'
+LOCATION 's3://datavault-v2/audit/gtfs_rt/'
 TBLPROPERTIES (
     'projection.enabled'='true',
     'projection.ingest_date.type'='date',
@@ -68,7 +68,7 @@ TBLPROPERTIES (
     'projection.hour.range'='0,23',
     'projection.hour.digits'='2',
     'storage.location.template'=
-        's3://<PROJECT_BUCKET>/audit/gtfs_rt/ingest_date=${ingest_date}/hour=${hour}/'
+        's3://datavault-v2/audit/gtfs_rt/ingest_date=${ingest_date}/hour=${hour}/'
 );
 
 
@@ -97,7 +97,7 @@ PARTITIONED BY (
     partition_hour string
 )
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://<PROJECT_BUCKET>/quality/gtfs_rt_snapshot_decode/'
+LOCATION 's3://datavault-v2/quality/gtfs_rt_snapshot_decode/'
 TBLPROPERTIES (
     'projection.enabled'='true',
     'projection.partition_date.type'='date',
@@ -107,7 +107,7 @@ TBLPROPERTIES (
     'projection.partition_hour.range'='0,23',
     'projection.partition_hour.digits'='2',
     'storage.location.template'=
-        's3://<PROJECT_BUCKET>/quality/gtfs_rt_snapshot_decode/ingest_date=${partition_date}/hour=${partition_hour}/'
+        's3://datavault-v2/quality/gtfs_rt_snapshot_decode/ingest_date=${partition_date}/hour=${partition_hour}/'
 );
 
 

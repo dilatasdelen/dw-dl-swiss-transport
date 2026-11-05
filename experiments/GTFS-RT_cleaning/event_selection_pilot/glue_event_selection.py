@@ -59,9 +59,9 @@ def configuration(bucket, run_ids, output_run_id, start, end, rule_version):
     if lower >= upper:
         raise ValueError("WINDOW_START_UTC must be before WINDOW_END_UTC")
     return {
-        "input_roots": [f"s3://{bucket}/experiments/staging_silver_pilot/run_id={label}/" for label in labels],
+        "input_roots": [f"s3://{bucket}/silver/gtfs_rt_processed/run_id={label}/" for label in labels],
         "input_run_ids": labels,
-        "output_root": f"s3://{bucket}/experiments/event_selection_pilot/run_id={output_run_id}/",
+        "output_root": f"s3://{bucket}/silver/gtfs_rt_event_selection/run_id={output_run_id}/",
         "start_epoch": lower, "end_epoch": upper, "rule_version": rule_version,
     }
 

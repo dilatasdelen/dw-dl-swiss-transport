@@ -6,9 +6,9 @@
 -- This covers 15:00 inclusive to 23:00 exclusive. Edit the WHERE values
 -- to inspect another completed collection period.
 --
--- The FROM clause uses the already deployed pilot view. If the environment
--- instead uses the generic view from athena_gtfs_rt_monitoring.sql, change
--- only the FROM target to swiss_transit.vw_gtfs_rt_monitoring_hourly.
+-- The FROM clause uses the view created by athena_gtfs_rt_monitoring.sql in
+-- the datavault-v2 deployment. Change the example date/hour filter below to
+-- the completed collection period being checked in the new bucket.
 --
 -- Interpretation:
 -- * collection_success_percent = successful attempts / recorded attempts.
@@ -36,7 +36,7 @@ SELECT
     parse_failed_files,
     invalid_hash_files,
     pipeline_status
-FROM swiss_transit.vw_gtfs_rt_monitoring_pilot
+FROM swiss_transit.vw_gtfs_rt_monitoring_hourly
 WHERE ingest_date = '2026-10-12'
   AND CAST(hour AS integer) BETWEEN 15 AND 22
 ORDER BY CAST(hour AS integer) DESC;

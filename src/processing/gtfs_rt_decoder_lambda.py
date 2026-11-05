@@ -1,9 +1,7 @@
-"""S3-triggered Lambda: one raw GTFS-RT snapshot -> decoded NDJSON staging.
+"""S3-triggered Lambda: one Bronze GTFS-RT snapshot -> decoded Silver NDJSON.
 
-This is the default pilot path because it processes one object at a time and
-does not require a Glue job for protobuf decoding.  The output is deliberately
-named ``staging``: rows are not eligible for the analytical warehouse until
-they have been matched to the corresponding GTFS Static version.
+Decoded rows retain the full captured feed. Static matching and study-area
+filtering run separately in Glue before downstream analytical use.
 
 Package ``gtfs_rt_snapshot.py`` beside this file in the Lambda ZIP.
 """
@@ -27,10 +25,10 @@ except ImportError:
 
 s3 = boto3.client("s3")
 
-DATA_BUCKET = os.environ["DATA_BUCKET"]
-RAW_PREFIX = os.environ.get("RAW_PREFIX", "raw/gtfs_rt/").strip("/") + "/"
+DATA_BUCKET = os.environ.get("DATA_BUCKET", "datavault-v2")
+RAW_PREFIX = os.environ.get("RAW_PREFIX", "bronze/gtfs_rt/").strip("/") + "/"
 STAGING_PREFIX = (
-    os.environ.get("STAGING_PREFIX", "staging/gtfs_rt_prediction_snapshot")
+    os.environ.get("STAGING_PREFIX", "silver/gtfs_rt_decoded")
     .strip("/")
 )
 QUALITY_PREFIX = (
