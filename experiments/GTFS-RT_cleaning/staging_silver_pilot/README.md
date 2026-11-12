@@ -1,6 +1,6 @@
 # AWS Glue job 1: Silver prediction history
 
-[Code](glue_staging_silver.py) · [Execution report](reports/hour-20261012-20.report.json)
+[Code](../../../src/processing/glue_staging_silver.py) · [Execution report](reports/hour-20261012-20.report.json)
 
 Tested study-area filtering and versioned GTFS Static matching on one hour of
 decoded GTFS-RT data. The job retains prediction history and raw-capture lineage.

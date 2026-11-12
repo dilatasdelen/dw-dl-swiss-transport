@@ -1,6 +1,6 @@
 # AWS Glue job 2: event candidates and prediction revisions
 
-[Code](glue_event_selection.py) · [Execution report](reports/events-20261012-20-v1-2.report.json)
+[Code](../../../src/processing/glue_event_selection.py) · [Execution report](reports/events-20261012-20-v1-2.report.json)
 
 We split the jobs to preserve job 1's detailed prediction history while
 job 2 derives event-level candidates and revision summaries separately.

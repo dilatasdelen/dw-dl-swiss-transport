@@ -2,6 +2,9 @@
 
 Select the latest valid prediction per event and summarise revisions within
 the requested feed-time window, preserving the Silver history.
+
+Validate replay keys before sorting, calculate revisions
+on narrow rows, and attach the full row only after selecting event candidates.
 """
 
 import json
@@ -12,6 +15,7 @@ from time import perf_counter
 
 
 RULE_VERSION = "pilot_latest_valid_feed_v1"
+PROCESSING_VERSION = "narrow_windows_v1"
 EVENT_KEY_COLUMNS = ["source", "service_date", "trip_id", "stop_id",
                      "effective_stop_sequence", "event_type", "feed_version"]
 VALUE_COLUMNS = ["delay_seconds", "published_time_epoch", "uncertainty_seconds"]
@@ -69,6 +73,17 @@ def configuration(bucket, run_ids, output_run_id, start, end, rule_version):
 def sql_plan(start_epoch, end_epoch):
     if not isinstance(start_epoch, int) or not isinstance(end_epoch, int) or start_epoch >= end_epoch:
         raise ValueError("Invalid integer selection bounds")
+    replay_audit = """
+        SELECT COUNT(*) AS distinct_prediction_signatures,
+          COALESCE(SUM(CASE WHEN copies > 1 THEN 1 ELSE 0 END), 0) AS repeated_prediction_signatures,
+          COALESCE(SUM(CASE WHEN first_content <> last_content THEN 1 ELSE 0 END), 0) AS conflicting_prediction_signatures
+        FROM (
+          SELECT prediction_signature, COUNT(*) AS copies,
+            MIN(replay_content_signature) AS first_content,
+            MAX(replay_content_signature) AS last_content
+          FROM history_input GROUP BY prediction_signature
+        ) signatures
+    """
     replay_conflicts = """
         SELECT prediction_signature, COUNT(DISTINCT replay_content_signature) AS content_versions
         FROM history_input GROUP BY prediction_signature
@@ -136,12 +151,16 @@ def sql_plan(start_epoch, end_epoch):
         FROM safe_eligible e
     """
     timeline = "SELECT * FROM point_ranked WHERE point_rank = 1"
+    # Wide source/reference/lineage columns are not needed by revision windows.
+    # One row per event/feed time makes the ascending order unambiguous.
+    # Reverse position = event size - ascending position + 1; no DESC sort.
     changes = """
-        SELECT t.*,
+        SELECT event_key, prediction_signature, feed_timestamp, value_signature, delay_seconds,
           ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY feed_timestamp) AS timeline_number,
           LAG(value_signature) OVER (PARTITION BY event_key ORDER BY feed_timestamp) AS previous_value_signature,
           LAG(delay_seconds) OVER (PARTITION BY event_key ORDER BY feed_timestamp) AS previous_delay_seconds,
-          ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY feed_timestamp DESC) AS latest_rank
+          COUNT(*) OVER (PARTITION BY event_key)
+            - ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY feed_timestamp) + 1 AS latest_rank
         FROM timeline t
     """
     summary = """
@@ -167,7 +186,9 @@ def sql_plan(start_epoch, end_epoch):
         GROUP BY event_key
     """
     candidates = """
-        SELECT c.*, s.prediction_observation_count, s.prediction_revision_count,
+        SELECT t.*, c.timeline_number, c.previous_value_signature,
+          c.previous_delay_seconds, c.latest_rank,
+          s.prediction_observation_count, s.prediction_revision_count,
           s.delay_revision_count, s.minimum_published_delay_seconds,
           s.maximum_published_delay_seconds, s.first_published_delay_seconds,
           s.first_valid_feed_timestamp, s.last_valid_feed_timestamp,
@@ -176,6 +197,8 @@ def sql_plan(start_epoch, end_epoch):
           a.distinct_input_prediction_count,
           CASE WHEN a.last_observed_feed_timestamp > c.feed_timestamp THEN TRUE ELSE FALSE END AS has_newer_invalid_observation
         FROM changes c
+        JOIN timeline t ON c.prediction_signature = t.prediction_signature
+          AND c.event_key = t.event_key AND c.feed_timestamp = t.feed_timestamp
         JOIN revision_summary_base s ON c.event_key = s.event_key
         JOIN observed_summary a ON c.event_key = a.event_key
         WHERE c.latest_rank = 1
@@ -197,6 +220,7 @@ def sql_plan(start_epoch, end_epoch):
           ON e.prediction_signature = l.prediction_signature
     """
     return {
+        "replay_audit": replay_audit,
         "replay_conflicts": replay_conflicts, "replay_ranked": replay_ranked,
         "history_unique": unique, "observations": classified, "eligible": eligible,
         "point_conflicts": point_conflicts, "blocked_events": blocked,
@@ -205,6 +229,13 @@ def sql_plan(start_epoch, end_epoch):
         "observed_summary": observed_summary, "event_candidates_base": candidates,
         "lineage_unique": lineage_unique, "selected_capture_lineage": selected_lineage,
     }
+
+
+def replay_strategy(audit):
+    """Skip replay sorting only after proving every prediction key is unique."""
+    if audit["conflicting_prediction_signatures"]:
+        raise ValueError("Conflicting copies of an upstream prediction. Select one reference-consistent run per partition.")
+    return "rank_replays" if audit["repeated_prediction_signatures"] else "unique_signatures"
 
 
 def main():
@@ -311,26 +342,54 @@ def main():
     if history.filter("prediction_signature IS NULL OR trim(prediction_signature) = ''").limit(1).count():
         raise ValueError("Upstream history has missing prediction signatures")
     plan = sql_plan(config["start_epoch"], config["end_epoch"])
-    spark.sql(plan["replay_conflicts"]).createOrReplaceTempView("replay_conflicts")
-    if spark.table("replay_conflicts").limit(1).count():
-        raise ValueError("Conflicting copies of an upstream prediction. Select one reference-consistent run per partition.")
-    spark.sql(plan["replay_ranked"]).createOrReplaceTempView("replay_ranked")
-    unique = materialize("history_unique", spark.sql(plan["history_unique"]))
-    history.unpersist()
+    replay_audit_started = perf_counter()
+    audit = spark.sql(plan["replay_audit"]).first().asDict()
+    strategy = replay_strategy(audit)
+    times["replay_audit"] = round(perf_counter() - replay_audit_started, 3)
+    if strategy == "unique_signatures":
+        # Reuse the existing cache instead of sorting/caching a second wide copy.
+        unique = history.withColumn("replay_rank", F.lit(1).cast("int"))
+        unique.createOrReplaceTempView("history_unique")
+        counts["history_unique"] = counts["history_input"]
+        times["history_unique"] = 0.0
+    else:
+        spark.sql(plan["replay_ranked"]).createOrReplaceTempView("replay_ranked")
+        unique = materialize("history_unique", spark.sql(plan["history_unique"]))
+        history.unpersist()
     observations = materialize("observations", spark.sql(plan["observations"]))
-    unique.unpersist()
-    eligible = materialize("eligible", spark.sql(plan["eligible"]))
+    if strategy == "unique_signatures":
+        history.unpersist()
+    else:
+        unique.unpersist()
+    # The eligible subset usually contains nearly the entire input. Read it
+    # from the observations cache rather than retaining another wide copy.
+    quality = observations.groupBy("selection_reason").count().persist(StorageLevel.MEMORY_AND_DISK)
+    quality_rows = [row.asDict() for row in quality.collect()]
+    eligible = spark.sql(plan["eligible"])
+    eligible.createOrReplaceTempView("eligible")
+    counts["eligible"] = next((row["count"] for row in quality_rows if row["selection_reason"] == "eligible"), 0)
     spark.sql(plan["point_conflicts"]).createOrReplaceTempView("point_conflicts")
     blocked = materialize("blocked_events", spark.sql(plan["blocked_events"]))
     for name in ["safe_eligible", "point_ranked"]:
         spark.sql(plan[name]).createOrReplaceTempView(name)
     timeline = materialize("timeline", spark.sql(plan["timeline"]))
-    for name in ["changes", "revision_summary_base", "observed_summary"]:
+    # Both the summary and latest-row selection reuse these narrow windows.
+    changes = materialize("changes", spark.sql(plan["changes"]))
+    for name in ["revision_summary_base", "observed_summary"]:
         spark.sql(plan[name]).createOrReplaceTempView(name)
     candidates = materialize("event_candidates_base", spark.sql(plan["event_candidates_base"]))
-    if candidates.select("event_key").distinct().count() != counts["event_candidates_base"]:
+    changes.unpersist()
+    timeline.unpersist()
+    candidate_metrics = candidates.agg(
+        F.countDistinct("event_key").alias("distinct_event_keys"),
+        F.sum("prediction_observation_count").alias("summarized_observations"),
+        F.sum(F.when(F.col("delay_seconds") == 0, 1).otherwise(0)).alias("zero_delay_events"),
+        F.sum(F.when(F.col("has_newer_invalid_observation"), 1).otherwise(0)).alias("newer_invalid_events"),
+        F.sum(F.when(F.col("prediction_revision_count") > 0, 1).otherwise(0)).alias("events_with_revisions"),
+    ).first().asDict()
+    if candidate_metrics["distinct_event_keys"] != counts["event_candidates_base"]:
         raise RuntimeError("Event output is not unique by event_key")
-    summarized_observations = candidates.agg(F.sum("prediction_observation_count")).first()[0] or 0
+    summarized_observations = candidate_metrics["summarized_observations"] or 0
     if summarized_observations != counts["timeline"]:
         raise RuntimeError("Event summaries do not reconcile to the prediction timeline")
 
@@ -374,21 +433,23 @@ def main():
                             "selection_status", "is_final_published_prediction")
     rejected = observations.filter("selection_reason <> 'eligible'")
     blocked_rows = eligible.join(blocked.select("event_key").distinct(), "event_key", "inner")
-    quality = observations.groupBy("selection_reason").count()
     report = {
         "run_id": args["RUN_ID"], "input_run_ids": config["input_run_ids"],
         "selection_window": {"start_utc": args["WINDOW_START_UTC"], "end_utc_exclusive": args["WINDOW_END_UTC"]},
         "selection_rule_version": RULE_VERSION, "selection_status": "latest_valid_in_selected_window",
         "window_time_basis": "feed_timestamp; start inclusive, end exclusive",
         "final_published_prediction_selected": False,
+        "processing_version": PROCESSING_VERSION,
+        "replay_strategy": strategy, "replay_audit": audit,
+        "cache_strategy": "eligible view over observations; reusable narrow revision windows",
         "counts": counts, "stage_materialization_seconds": times,
         "replayed_history_rows_removed": counts["history_input"] - counts["history_unique"],
         "valid_observation_rows_collapsed_to_events": counts["timeline"] - counts["event_candidates_base"],
-        "selection_reasons": [r.asDict() for r in quality.collect()],
+        "selection_reasons": quality_rows,
         "blocked_event_count": blocked.select("event_key").distinct().count(),
-        "selected_zero_delay_events": events.filter("delay_seconds = 0").count(),
-        "selected_events_with_newer_invalid_observations": events.filter("has_newer_invalid_observation").count(),
-        "events_with_prediction_revisions": events.filter("prediction_revision_count > 0").count(),
+        "selected_zero_delay_events": candidate_metrics["zero_delay_events"] or 0,
+        "selected_events_with_newer_invalid_observations": candidate_metrics["newer_invalid_events"] or 0,
+        "events_with_prediction_revisions": candidate_metrics["events_with_revisions"] or 0,
         "source_scope": "only explicitly supplied successful job-1 runs",
         "silver_history_modified": False,
         "warnings": ["Provisional selection. Journey-wide finalisation and observation-window completeness are not certified."],
