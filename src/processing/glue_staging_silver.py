@@ -30,6 +30,50 @@ CAPTURE_FIELDS = {
     "raw_object_key", "payload_sha256", "payload_hash_valid", "ingested_at_utc"
 }
 PREDICTION_COLUMNS = [c for c in STAGING_COLUMNS if c not in CAPTURE_FIELDS]
+REJECTED_COLUMNS = [
+    "source", "raw_object_key", "input_object_key", "payload_sha256", "payload_hash_valid",
+    "ingested_at_utc", "feed_timestamp", "feed_version", "entity_id", "trip_id", "route_id",
+    "service_date", "start_time", "stop_id", "stop_sequence", "event_type",
+    "published_time_epoch", "delay_seconds", "is_delay_missing", "study_canton_code",
+    "boundary_release", "canton_join_status", "precheck_reason", "area_status",
+]
+
+
+def add_prediction_identity(frame):
+    from pyspark.sql import functions as F
+
+    # The existing lineage ID hashes the original timestamp string, not its
+    # parsed Spark timestamp representation.
+    source_fields = [
+        F.col("_source_ingested_at_utc").alias(name) if name == "ingested_at_utc" else F.col(name)
+        for name in STAGING_COLUMNS
+    ]
+    options = {"ignoreNullFields": "false"}
+    enriched = frame.withColumn("lineage_id", F.sha2(F.to_json(
+        F.struct(*source_fields, F.col("input_object_key")), options,
+    ), 256)).withColumn("prediction_signature", F.sha2(F.to_json(
+        F.struct(*[F.col(name) for name in PREDICTION_COLUMNS]), options,
+    ), 256))
+    source_columns = [*STAGING_COLUMNS, "input_object_key"]
+    other_columns = [
+        name for name in frame.columns
+        if name not in source_columns and name != "_source_ingested_at_utc"
+    ]
+    return enriched.select(*source_columns, "lineage_id", "prediction_signature", *other_columns)
+
+
+def diagnostic_outputs(canton, area_summary, match_summary, detail):
+    rejected = canton.filter("area_status NOT IN ('eligible', 'outside_study_area')")
+    if detail == "full":
+        return [
+            ("rejected_rows", add_prediction_identity(rejected)),
+            ("quality/area_counts", area_summary),
+            ("quality/static_match", match_summary),
+        ]
+    return [
+        ("rejected_rows", rejected.select(*REJECTED_COLUMNS)),
+        ("quality/area_counts", area_summary),
+    ]
 
 
 def experiment_paths(bucket, ingest_date, ingest_hour, run_id):
@@ -213,14 +257,20 @@ def main():
     from pyspark.context import SparkContext
     from pyspark.sql import functions as F
 
-    args = getResolvedOptions(sys.argv, [
+    parameters = [
         "JOB_NAME", "DATA_BUCKET", "INGEST_DATE", "INGEST_HOUR", "FEED_VERSION",
         "RUN_ID", "MAX_INPUT_FILES",
-    ])
+    ]
+    if "--DIAGNOSTIC_DETAIL" in sys.argv:
+        parameters.append("DIAGNOSTIC_DETAIL")
+    args = getResolvedOptions(sys.argv, parameters)
+    diagnostic_detail = args.get("DIAGNOSTIC_DETAIL", "compact")
+    if diagnostic_detail not in {"compact", "full"}:
+        raise ValueError("DIAGNOSTIC_DETAIL must be compact or full")
     bucket, version = args["DATA_BUCKET"], args["FEED_VERSION"]
     plan = sql_plan(version)
     input_prefix, output_root = experiment_paths(
-        bucket, args["INGEST_DATE"], args["INGEST_HOUR"], args["RUN_ID"]
+        bucket, args["INGEST_DATE"], args["INGEST_HOUR"], args["RUN_ID"],
     )
     limit = int(args["MAX_INPUT_FILES"])
     if limit < 0:
@@ -268,14 +318,9 @@ def main():
 
     staging_paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects]
     staging = spark.read.schema(STAGING_DDL).option("mode", "FAILFAST").json(staging_paths)
-    staging = staging.withColumn("input_object_key", F.input_file_name())
-    json_options = {"ignoreNullFields": "false"}
-    staging = staging.withColumn("lineage_id", F.sha2(F.to_json(
-        F.struct(*[F.col(c) for c in STAGING_COLUMNS], F.col("input_object_key")),
-        json_options,
-    ), 256)).withColumn("prediction_signature", F.sha2(F.to_json(
-        F.struct(*[F.col(c) for c in PREDICTION_COLUMNS]), json_options,
-    ), 256)).withColumn("ingested_at_utc", F.to_timestamp("ingested_at_utc"))
+    staging = (staging.withColumn("input_object_key", F.input_file_name())
+               .withColumn("_source_ingested_at_utc", F.col("ingested_at_utc"))
+               .withColumn("ingested_at_utc", F.to_timestamp("ingested_at_utc")))
     staging = materialize("staging", staging)
     if not counts["staging"]:
         raise ValueError("Selected staging objects contain no prediction rows")
@@ -301,7 +346,7 @@ def main():
     spark.sql(plan["prechecked"]).createOrReplaceTempView("prechecked")
     canton = materialize("canton_classified", spark.sql(plan["canton_classified"]))
     staging.unpersist()
-    study = materialize("study_rows", spark.sql(plan["study_rows"]))
+    study = materialize("study_rows", add_prediction_identity(spark.sql(plan["study_rows"])))
 
     static = spark.read.parquet(static_path).select(
         F.col("feed_version").cast("string").alias("feed_version"),
@@ -326,10 +371,8 @@ def main():
     history = materialize("prediction_history", spark.sql(plan["prediction_history"]))
     lineage = spark.sql(plan["capture_lineage"])
 
-    # Full detail is retained for unassignable/rejected records. Known stops
-    # outside the study area have counts and raw lineage in the area summary;
-    # their original detail already remains in immutable raw/staging storage.
-    rejected = canton.filter("area_status NOT IN ('eligible', 'outside_study_area')")
+    # The area summary retains per-capture counts, including known stops
+    # outside the study area. Full source detail remains in raw/staging storage.
     area_summary = canton.groupBy("area_status", "study_canton_code", "raw_object_key").count()
     match_summary = matched.groupBy("static_match_status", "static_match_reason").count()
     report = {
@@ -357,9 +400,11 @@ def main():
     if lineage_rows != counts["matched"]:
         raise RuntimeError("Lineage row reconciliation failed")
 
-    for name, frame in [("prediction_history", history), ("capture_lineage", lineage),
-                        ("rejected_rows", rejected), ("quality/area_counts", area_summary),
-                        ("quality/static_match", match_summary)]:
+    outputs = [("prediction_history", history), ("capture_lineage", lineage)]
+    outputs.extend(diagnostic_outputs(canton, area_summary, match_summary, diagnostic_detail))
+    report["diagnostic_detail"] = diagnostic_detail
+    report["output_datasets"] = [name for name, _ in outputs]
+    for name, frame in outputs:
         frame.coalesce(4 if name in {"prediction_history", "capture_lineage"} else 1).write.mode(
             "errorifexists"
         ).parquet(output_root + name + "/")

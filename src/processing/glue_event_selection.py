@@ -36,6 +36,30 @@ REPLAY_CONTENT_COLUMNS = [c for c in HISTORY_COLUMNS if c not in {
     "raw_object_key", "payload_sha256", "ingested_at_utc", "lineage_id"
 }]
 
+EXCLUDED_COLUMNS = [
+    *EVENT_KEY_COLUMNS, "event_key", "event_key_valid", "stop_sequence", "feed_timestamp",
+    "trip_update_timestamp", "start_time", "route_id", "delay_seconds", "is_delay_missing",
+    "published_time_epoch", "payload_hash_valid", "static_match_status", "static_match_reason",
+    "selection_reason", "prediction_signature", "lineage_id", "raw_object_key", "payload_sha256",
+    "ingested_at_utc", "upstream_run_id", "value_signature",
+]
+
+
+def diagnostic_outputs(observations, eligible, blocked, quality, blocked_event_count, detail):
+    rejected = observations.filter("selection_reason <> 'eligible'")
+    if detail == "compact":
+        rejected = rejected.select(*EXCLUDED_COLUMNS)
+    outputs = [("excluded_observations", rejected)]
+    if blocked_event_count or detail == "full":
+        blocked_rows = eligible.join(blocked.select("event_key").distinct(), "event_key", "inner")
+        if detail == "compact":
+            blocked_rows = blocked_rows.select(*EXCLUDED_COLUMNS)
+        outputs.append(("blocked_event_observations", blocked_rows))
+        outputs.append(("quality/blocked_events", blocked))
+    if detail == "full":
+        outputs.append(("quality/selection_reasons", quality))
+    return outputs
+
 
 def utc_second(value):
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -70,9 +94,11 @@ def configuration(bucket, run_ids, output_run_id, start, end, rule_version):
     }
 
 
-def sql_plan(start_epoch, end_epoch):
+def sql_plan(start_epoch, end_epoch, *, point_ranking="wide"):
     if not isinstance(start_epoch, int) or not isinstance(end_epoch, int) or start_epoch >= end_epoch:
         raise ValueError("Invalid integer selection bounds")
+    if point_ranking not in {"wide", "narrow"}:
+        raise ValueError("POINT_RANKING must be wide or narrow")
     replay_audit = """
         SELECT COUNT(*) AS distinct_prediction_signatures,
           COALESCE(SUM(CASE WHEN copies > 1 THEN 1 ELSE 0 END), 0) AS repeated_prediction_signatures,
@@ -142,15 +168,29 @@ def sql_plan(start_epoch, end_epoch):
     """
     # Entity/vehicle metadata can create multiple upstream signatures at the
     # same event/feed instant. Equivalent values are one timeline observation.
-    point_ranked = """
-        SELECT e.*, ROW_NUMBER() OVER (
+    point_columns = "e.*"
+    timeline_columns = "*"
+    candidate_source = "timeline"
+    candidate_rank = ""
+    if point_ranking == "narrow":
+        point_columns = (
+            "event_key, feed_timestamp, trip_update_timestamp, ingested_at_utc, "
+            "prediction_signature, lineage_id, value_signature, delay_seconds"
+        )
+        timeline_columns = "event_key, prediction_signature, feed_timestamp, value_signature, delay_seconds"
+        # Replay checks guarantee one observation per prediction_signature.
+        # Latest keys only come from non-blocked, eligible observations.
+        candidate_source = "observations"
+        candidate_rank = ", CAST(1 AS INT) AS point_rank"
+    point_ranked = f"""
+        SELECT {point_columns}, ROW_NUMBER() OVER (
           PARTITION BY event_key, feed_timestamp
           ORDER BY trip_update_timestamp DESC NULLS LAST, ingested_at_utc DESC,
                    prediction_signature, lineage_id
         ) AS point_rank
         FROM safe_eligible e
     """
-    timeline = "SELECT * FROM point_ranked WHERE point_rank = 1"
+    timeline = f"SELECT {timeline_columns} FROM point_ranked WHERE point_rank = 1"
     # Wide source/reference/lineage columns are not needed by revision windows.
     # One row per event/feed time makes the ascending order unambiguous.
     # Reverse position = event size - ascending position + 1; no DESC sort.
@@ -185,8 +225,8 @@ def sql_plan(start_epoch, end_epoch):
         WHERE event_key_valid = TRUE AND feed_timestamp >= {start_epoch} AND feed_timestamp < {end_epoch}
         GROUP BY event_key
     """
-    candidates = """
-        SELECT t.*, c.timeline_number, c.previous_value_signature,
+    candidates = f"""
+        SELECT t.*{candidate_rank}, c.timeline_number, c.previous_value_signature,
           c.previous_delay_seconds, c.latest_rank,
           s.prediction_observation_count, s.prediction_revision_count,
           s.delay_revision_count, s.minimum_published_delay_seconds,
@@ -197,7 +237,7 @@ def sql_plan(start_epoch, end_epoch):
           a.distinct_input_prediction_count,
           CASE WHEN a.last_observed_feed_timestamp > c.feed_timestamp THEN TRUE ELSE FALSE END AS has_newer_invalid_observation
         FROM changes c
-        JOIN timeline t ON c.prediction_signature = t.prediction_signature
+        JOIN {candidate_source} t ON c.prediction_signature = t.prediction_signature
           AND c.event_key = t.event_key AND c.feed_timestamp = t.feed_timestamp
         JOIN revision_summary_base s ON c.event_key = s.event_key
         JOIN observed_summary a ON c.event_key = a.event_key
@@ -247,12 +287,24 @@ def main():
     from pyspark.context import SparkContext
     from pyspark.sql import functions as F
 
-    args = getResolvedOptions(sys.argv, [
+    parameters = [
         "JOB_NAME", "DATA_BUCKET", "INPUT_RUN_IDS", "RUN_ID",
         "WINDOW_START_UTC", "WINDOW_END_UTC", "RULE_VERSION",
-    ])
-    config = configuration(args["DATA_BUCKET"], args["INPUT_RUN_IDS"], args["RUN_ID"],
-                           args["WINDOW_START_UTC"], args["WINDOW_END_UTC"], args["RULE_VERSION"])
+    ]
+    if "--DIAGNOSTIC_DETAIL" in sys.argv:
+        parameters.append("DIAGNOSTIC_DETAIL")
+    if "--POINT_RANKING" in sys.argv:
+        parameters.append("POINT_RANKING")
+    args = getResolvedOptions(sys.argv, parameters)
+    diagnostic_detail = args.get("DIAGNOSTIC_DETAIL", "compact")
+    if diagnostic_detail not in {"compact", "full"}:
+        raise ValueError("DIAGNOSTIC_DETAIL must be compact or full")
+    config = configuration(
+        args["DATA_BUCKET"], args["INPUT_RUN_IDS"], args["RUN_ID"],
+        args["WINDOW_START_UTC"], args["WINDOW_END_UTC"], args["RULE_VERSION"],
+    )
+    point_ranking = args.get("POINT_RANKING", "wide")
+    plan = sql_plan(config["start_epoch"], config["end_epoch"], point_ranking=point_ranking)
     bucket = args["DATA_BUCKET"]
     s3 = boto3.client("s3")
     prefix = config["output_root"].split(f"s3://{bucket}/", 1)[1]
@@ -341,7 +393,6 @@ def main():
     # Missing signatures cannot be safely used as replay keys.
     if history.filter("prediction_signature IS NULL OR trim(prediction_signature) = ''").limit(1).count():
         raise ValueError("Upstream history has missing prediction signatures")
-    plan = sql_plan(config["start_epoch"], config["end_epoch"])
     replay_audit_started = perf_counter()
     audit = spark.sql(plan["replay_audit"]).first().asDict()
     strategy = replay_strategy(audit)
@@ -431,22 +482,22 @@ def main():
                             "observation_span_seconds", "published_delay_stddev_seconds", "has_newer_invalid_observation",
                             "selection_rule_version", "selection_window_start_utc", "selection_window_end_utc_exclusive",
                             "selection_status", "is_final_published_prediction")
-    rejected = observations.filter("selection_reason <> 'eligible'")
-    blocked_rows = eligible.join(blocked.select("event_key").distinct(), "event_key", "inner")
+    blocked_event_count = blocked.select("event_key").distinct().count()
     report = {
         "run_id": args["RUN_ID"], "input_run_ids": config["input_run_ids"],
         "selection_window": {"start_utc": args["WINDOW_START_UTC"], "end_utc_exclusive": args["WINDOW_END_UTC"]},
         "selection_rule_version": RULE_VERSION, "selection_status": "latest_valid_in_selected_window",
         "window_time_basis": "feed_timestamp; start inclusive, end exclusive",
         "final_published_prediction_selected": False,
-        "processing_version": PROCESSING_VERSION,
+        "processing_version": "narrow_point_ranking_v2" if point_ranking == "narrow" else PROCESSING_VERSION,
+        "point_ranking": point_ranking,
         "replay_strategy": strategy, "replay_audit": audit,
         "cache_strategy": "eligible view over observations; reusable narrow revision windows",
         "counts": counts, "stage_materialization_seconds": times,
         "replayed_history_rows_removed": counts["history_input"] - counts["history_unique"],
         "valid_observation_rows_collapsed_to_events": counts["timeline"] - counts["event_candidates_base"],
         "selection_reasons": quality_rows,
-        "blocked_event_count": blocked.select("event_key").distinct().count(),
+        "blocked_event_count": blocked_event_count,
         "selected_zero_delay_events": candidate_metrics["zero_delay_events"] or 0,
         "selected_events_with_newer_invalid_observations": candidate_metrics["newer_invalid_events"] or 0,
         "events_with_prediction_revisions": candidate_metrics["events_with_revisions"] or 0,
@@ -458,10 +509,14 @@ def main():
         raise RuntimeError("Selection/exclusion counts do not reconcile")
     if counts["eligible"] < counts["timeline"] or counts["timeline"] < counts["event_candidates_base"]:
         raise RuntimeError("Unexpected event/timeline row expansion")
-    for name, frame in [("event_candidates", events), ("revision_summary", summary),
-                        ("selected_capture_lineage", annotate(selected_lineage)),
-                        ("excluded_observations", rejected), ("blocked_event_observations", blocked_rows),
-                        ("quality/selection_reasons", quality), ("quality/blocked_events", blocked)]:
+    outputs = [("event_candidates", events), ("revision_summary", summary),
+               ("selected_capture_lineage", annotate(selected_lineage))]
+    outputs.extend(diagnostic_outputs(
+        observations, eligible, blocked, quality, blocked_event_count, diagnostic_detail,
+    ))
+    report["diagnostic_detail"] = diagnostic_detail
+    report["output_datasets"] = [name for name, _ in outputs]
+    for name, frame in outputs:
         frame.coalesce(4 if name in {"event_candidates", "revision_summary", "selected_capture_lineage"} else 1).write.mode("errorifexists").parquet(config["output_root"] + name + "/")
     report["total_job_script_seconds"] = round(perf_counter() - started, 3)
     report["status"] = "success"
