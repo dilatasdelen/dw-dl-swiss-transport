@@ -3,6 +3,21 @@
 Choose either --SERVICE_DATE YYYY-MM-DD for one date, or --START_DATE
 YYYY-MM-DD and --END_DATE YYYY-MM-DD for an inclusive batch. Both modes
 require --DATA_BUCKET. Batch mode takes precedence if START_DATE is supplied.
+Set --CHECK_ONLY true to report Silver coverage without building Gold events.
+Coverage mode reads existing Silver data and publishes a small review report.
+
+Weekly refresh configuration
+- --WEEKLY true and --SOURCE_MODE both enable a moving date range.
+- --LAG_DAYS defaults to 2, measured in Swiss calendar dates.
+- --COLLECTION_END_DATE optionally caps future refreshes at a fixed date.
+- --CHECK_ONLY must be false to build weekly outputs.
+- New dates with processing-window, Ist-Daten, or forecast gaps are deferred.
+- Weekly runs reuse only completed Silver selection outputs.
+- The first route-aware refresh rebuilds the original GTFS-RT dates.
+- Existing historical-only outputs remain reusable by the updated audit.
+Set Glue maximum concurrent runs to 1 for this refresh job. After a successful
+refresh, run the audit in WEEKLY mode to update the approved manifest pointer.
+Deactivate the AWS scheduled trigger when recurring refreshes should stop.
 
 Workflow
 1. Find successful dates produced with the current rule version.
@@ -27,6 +42,7 @@ from datetime import date, datetime, timedelta, timezone
 import json
 import sys
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import boto3
 from awsglue.context import GlueContext
@@ -39,7 +55,7 @@ from pyspark.sql import Window, functions as F
 # This label identifies the enrichment rules used to build an output.
 # A successful date is skipped only when its report has this same version.
 # Change this label when a logic change requires rebuilding previous dates.
-RULE_VERSION = "gold-events-v2"
+RULE_VERSION = "gold-events-v3-route"
 
 # stop_id can recur in several Static feeds. Include the feed version so
 # platforms and stations resolve against the reference used by the event.
@@ -101,6 +117,9 @@ def normalize_gtfs(rows):
         .select(
             F.lit("gtfs_rt").alias("source_type"), "event_key", "service_date",
             "source", "trip_id", "stop_id", "event_type", "didok",
+            # GTFS route identifiers are scoped to a Static feed version.
+            # Keep the value from the selected prediction without a crosswalk.
+            F.col("route_id").cast("string").alias("route_id"),
             F.col("feed_version").alias("reference_feed_version"),
             F.col("study_canton_code").alias("source_canton"),
             "boundary_release", "delay_seconds", "silver_input", "raw_object_key",
@@ -130,6 +149,9 @@ def normalize_istdaten(rows):
             "source_type", "service_date", "trip_id", "bpuic", "sloid", "didok",
             "reference_feed_version", "boundary_release", "silver_input",
             "bronze_object_key", "operator", "line_id", "transport_type",
+            # Ist-Daten line_id remains source-specific. A null GTFS route_id
+            # makes the shared schema explicit without guessing equivalence.
+            F.lit(None).cast("string").alias("route_id"),
             "is_cancelled", "is_additional", "is_passing", "stop_mapping_method",
             F.col("matched_stop_id").alias("stop_id"),
             F.col("study_canton_code").alias("source_canton"),
@@ -342,8 +364,13 @@ def process_date(bucket, service_date, source_mode="both", batch_cache=None):
 
     # A prediction window is distinct from the service date. Select on the
     # records themselves so predictions made on another day are considered.
-    rt_keys = [key for key in list_keys("silver/gtfs_rt_event_selection/run_id=")
-               if "/event_candidates/" in key]
+    # Weekly coverage has already checked completion reports and markers.
+    # Reuse exactly those candidate files to exclude unfinished Silver runs.
+    if "validated_rt_keys" in batch_cache:
+        rt_keys = batch_cache["validated_rt_keys"]
+    else:
+        rt_keys = [key for key in list_keys("silver/gtfs_rt_event_selection/run_id=")
+                   if "/event_candidates/" in key]
     # Historical Ist-Daten mode reads one GTFS part only to obtain its schema.
     # An empty GTFS frame keeps the shared Gold columns available.
     # Normal combined mode continues to select candidates across all runs.
@@ -451,6 +478,22 @@ def process_date(bucket, service_date, source_mode="both", batch_cache=None):
                        weather_rows("historical_reanalysis"), forecast).persist(StorageLevel.DISK_ONLY)
     # Validate the final result before publishing any Parquet output.
     assert_unique(gold, EVENT_KEY, "Gold event")
+    # Reconcile the enriched route against the exact selected Silver candidate,
+    # using the Gold event key. Null-safe equality also handles missing values.
+    selected_routes = rt.select(
+        *EVENT_KEY, F.col("route_id").alias("selected_route_id"),
+        F.col("prediction_signature").alias("selected_prediction_signature"),
+    )
+    route_check = gold.where("source_type = 'gtfs_rt'").join(
+        selected_routes, EVENT_KEY, "full"
+    )
+    route_mismatches = route_check.where(
+        ~F.col("route_id").eqNullSafe(F.col("selected_route_id")) |
+        ~F.col("prediction_signature").eqNullSafe(F.col("selected_prediction_signature"))
+    ).count()
+    if route_mismatches:
+        raise RuntimeError(f"Selected Silver/Gold route mismatches: {route_mismatches}")
+
     # A match rate is the fraction of events with a context row/value.
     # A weather row can still contain null measurements for individual variables.
     # Report the two sources independently because their coverage differs.
@@ -458,6 +501,10 @@ def process_date(bucket, service_date, source_mode="both", batch_cache=None):
         row["source_type"]: row.asDict()
         for row in gold.groupBy("source_type").agg(
             F.count("*").alias("gold_events"),
+            F.sum(F.when(F.length(F.trim("route_id")) > 0, 1).otherwise(0))
+             .alias("route_id_present_events"),
+            F.sum(F.when(F.length(F.trim("line_id")) > 0, 1).otherwise(0))
+             .alias("line_id_present_events"),
             *[F.avg((~F.col(f"missing_{field}")).cast("double")).alias(f"{field}_match_rate")
               for field in ("weather_location", "weather", "canton", "elevation")],
         ).collect()
@@ -480,6 +527,11 @@ def process_date(bucket, service_date, source_mode="both", batch_cache=None):
         "status": "success",
         "rule_version": RULE_VERSION,
         "source_mode": source_mode,
+        "route_validation": {
+            "silver_selected_prediction_mismatches": route_mismatches,
+            "gtfs_route_key": ["reference_feed_version", "route_id"],
+            "istdaten_line_key": "line_id; no GTFS crosswalk applied",
+        },
         "weather_rule": "scheduled UTC hour; forecast available at prediction feed time",
         "elevation_rule": "same feed or exact parent station ID, didok and coordinates",
         "service_date": day,
@@ -543,30 +595,293 @@ def completed_dates(s3, bucket, source_mode="both"):
     return completed
 
 
+def local_day_bounds(day):
+    """Return the UTC bounds of a Swiss calendar date, including DST."""
+    swiss = ZoneInfo("Europe/Zurich")
+    start = datetime.combine(day, datetime.min.time(), tzinfo=swiss)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=swiss)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def uncovered_intervals(start, end, windows):
+    """Subtract completed selection windows from a half-open UTC interval."""
+    cursor = start
+    gaps = []
+    for left, right in sorted(windows):
+        if right <= cursor or left >= end:
+            continue
+        if left > cursor:
+            gaps.append((cursor, min(left, end)))
+        cursor = min(end, max(cursor, right))
+        if cursor == end:
+            break
+    if cursor < end:
+        gaps.append((cursor, end))
+    return [[left.isoformat(), right.isoformat()] for left, right in gaps]
+
+
+def check_source_coverage(bucket, days):
+    """Produce a review report before choosing the final analysis cutoff.
+
+    Selection windows describe completed Job 2 processing. Candidate rows
+    describe published predictions, so zero candidates in an hour alone
+    cannot establish that upstream collection was missing.
+    """
+    s3 = boto3.client("s3")
+    spark = GlueContext(SparkContext.getOrCreate()).spark_session
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    spark.conf.set("spark.sql.shuffle.partitions", "16")
+
+    def list_objects(prefix):
+        pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+        return [item for page in pages for item in page.get("Contents", [])]
+
+    def read_json(key):
+        with s3.get_object(Bucket=bucket, Key=key)["Body"] as body:
+            return json.load(body)
+
+    def parquet(keys):
+        # Explicit object paths preserve isolation between different datasets.
+        # Select only the columns needed for this read-only coverage scan.
+        return spark.read.option("recursiveFileLookup", "true").parquet(
+            *[f"s3://{bucket}/{key}" for key in keys]
+        )
+
+    rt_objects = list_objects("silver/gtfs_rt_event_selection/run_id=")
+    completed_roots = set()
+    windows = []
+    first_utc, _ = local_day_bounds(days[0])
+    _, last_utc = local_day_bounds(days[-1])
+    rt_object_keys = {item["Key"] for item in rt_objects}
+    for item in rt_objects:
+        key = item["Key"]
+        if not key.endswith("/report.json") or "/quality/" in key:
+            continue
+        report = read_json(key)
+        window = report.get("selection_window", {})
+        root = key.rsplit("/", 1)[0] + "/"
+        if not report.get("run_id") or not window:
+            continue
+        if report.get("status") != "success" or root + "_EXPERIMENT_SUCCESS" not in rt_object_keys:
+            continue
+        left = datetime.fromisoformat(window["start_utc"].replace("Z", "+00:00"))
+        right = datetime.fromisoformat(window["end_utc_exclusive"].replace("Z", "+00:00"))
+        if left < last_utc and right > first_utc:
+            windows.append((left, right))
+        # Reading all completed candidate roots retains cross-midnight
+        # predictions for a service date. Silver file statistics may prune
+        # irrelevant service dates without relying on run-folder names.
+        completed_roots.add(key.rsplit("/", 1)[0] + "/")
+
+    rt_keys = [item["Key"] for item in rt_objects
+               if "/event_candidates/" in item["Key"] and item["Key"].endswith(".parquet")
+               and item["Key"].split("event_candidates/", 1)[0] in completed_roots]
+    candidate_counts = {}
+    if rt_keys:
+        rt = parquet(rt_keys).select(
+            "service_date", "feed_version", "route_id", "prediction_signature"
+        ).where(F.col("service_date").between(days[0].strftime("%Y%m%d"),
+                                             days[-1].strftime("%Y%m%d")))
+        rows = rt.groupBy("service_date").agg(
+            F.count("*").alias("candidate_rows_across_runs"),
+            F.countDistinct("prediction_signature").alias("distinct_prediction_signatures"),
+            F.collect_set("feed_version").alias("reference_versions"),
+            F.sum(F.when(F.length(F.trim("route_id")) > 0, 1).otherwise(0))
+             .alias("route_id_present_rows"),
+        ).collect()
+        candidate_counts = {row["service_date"]: row.asDict() for row in rows}
+
+    # List Ist-Daten once, then consult its per-date successful Silver report.
+    ist_objects = list_objects("silver/stop_events/source=istdaten/date=")
+    ist_keys = {item["Key"] for item in ist_objects if item["Key"].endswith(".parquet")}
+    ist_reports = {item["Key"] for item in list_objects("quality/istdaten_stop_events/")
+                   if item["Key"].endswith("/report.json")}
+
+    # Weather coverage remains product-specific. In particular, a forecast
+    # must never substitute for missing historical reanalysis in Ist-Daten.
+    weather_objects = list_objects(WEATHER_PREFIX)
+    weather_keys = [item["Key"] for item in weather_objects
+                    if "/data_product=" in item["Key"] and item["Key"].endswith(".parquet")]
+    weather_by_day = {}
+    if weather_keys:
+        weather = parquet(weather_keys).select(
+            "data_product", "model", "location_id", "weather_time_utc", "retrieved_at_utc"
+        ).where(F.col("weather_time_utc").between(
+            F.timestamp_seconds(F.lit(int(first_utc.timestamp()))),
+            F.timestamp_seconds(F.lit(int(last_utc.timestamp()) - 1)),
+        ))
+        local_date = F.to_date(F.from_utc_timestamp("weather_time_utc", "Europe/Zurich"))
+        rows = weather.withColumn("local_date", local_date).groupBy(
+            "local_date", "data_product"
+        ).agg(
+            F.countDistinct(F.struct("location_id", "weather_time_utc"))
+             .alias("location_hours"),
+            F.countDistinct("location_id").alias("locations"),
+            F.collect_set("model").alias("models"),
+            F.min("retrieved_at_utc").alias("first_retrieval_utc"),
+            F.max("retrieved_at_utc").alias("last_retrieval_utc"),
+        ).collect()
+        for row in rows:
+            record = row.asDict()
+            weather_by_day.setdefault(str(row["local_date"]), {})[row["data_product"]] = record
+
+    mapping_keys = [item["Key"] for item in weather_objects
+                    if "/stop_to_location/" in item["Key"] and item["Key"].endswith(".parquet")]
+    expected_locations = (
+        parquet(mapping_keys).select("location_id").distinct().count() if mapping_keys else 0
+    )
+    dates = []
+    for day in days:
+        label = day.isoformat()
+        start, end = local_day_bounds(day)
+        silver_report_key = f"quality/istdaten_stop_events/date={label}/report.json"
+        ist_report = read_json(silver_report_key) if silver_report_key in ist_reports else {}
+        has_parts = any(key.startswith(f"silver/stop_events/source=istdaten/date={label}/")
+                        for key in ist_keys)
+        dates.append({
+            "service_date": label,
+            "swiss_calendar_day_hours": int((end - start).total_seconds() // 3600),
+            "expected_weather_locations": expected_locations,
+            "gtfs_rt": {
+                **candidate_counts.get(day.strftime("%Y%m%d"), {}),
+                "uncovered_job2_intervals_utc": uncovered_intervals(start, end, windows),
+            },
+            "istdaten": {
+                "parquet_present": has_parts,
+                "silver_report_status": ist_report.get("status", "missing"),
+                "written_rows": ist_report.get("written_rows"),
+            },
+            "weather": weather_by_day.get(label, {}),
+        })
+
+    report = {
+        "status": "coverage_review_required",
+        "requested_date_range": [str(days[0]), str(days[-1])],
+        "dates": dates,
+        "validated_candidate_files": rt_keys,
+        "limitations": [
+            "Completed Job 2 windows do not prove complete upstream GTFS-RT collection.",
+            "Weather totals do not prove every event has an eligible forecast snapshot.",
+            "Zero candidate rows can reflect no published predictions or missing processing.",
+            "Service-date journeys may extend beyond the Swiss calendar day.",
+            "Choose the cutoff and document intentionally partial dates before Gold approval.",
+        ],
+    }
+    key = f"quality/stop_event_analysis_coverage/run_id={uuid4().hex}/report.json"
+    s3.put_object(Bucket=bucket, Key=key, ContentType="application/json",
+                  Body=json.dumps(report, indent=2, default=str).encode("utf-8"))
+    print(json.dumps({"status": report["status"], "dates_checked": len(days),
+                      "coverage_report": f"s3://{bucket}/{key}"}))
+    report["report_key"] = key
+    return report
+
+
+def weekly_eligibility(record):
+    """Return reasons a new date should wait for a later weekly refresh."""
+    reasons = []
+    transport = record["gtfs_rt"]
+    if not transport.get("candidate_rows_across_runs"):
+        reasons.append("no_gtfs_rt_candidates")
+    if transport["uncovered_job2_intervals_utc"]:
+        reasons.append("incomplete_job2_processing_windows")
+    observed = record["istdaten"]
+    if not observed["parquet_present"] or observed["silver_report_status"] != "success":
+        reasons.append("missing_successful_istdaten_input")
+    # Forecast counts describe distinct grid/valid-hour pairs. Require all
+    # mapped grid locations over this calendar day before processing new dates.
+    # Historical weather may still be unavailable because of the ERA5 lag.
+    # Gold retains and reports that historical coverage gap explicitly.
+    forecast = record["weather"].get("forecast", {})
+    expected = record["expected_weather_locations"] * record["swiss_calendar_day_hours"]
+    if not expected or forecast.get("location_hours", 0) < expected:
+        reasons.append("incomplete_forecast_location_hours")
+    return reasons
+
+
+def weekly_dates(arguments, today=None):
+    """Use Swiss dates and a configurable lag to avoid today's partial inputs."""
+    if today is None:
+        today = datetime.now(ZoneInfo("Europe/Zurich")).date()
+    lag = int(arguments.get("LAG_DAYS", "2"))
+    if lag < 1:
+        raise ValueError("LAG_DAYS must be at least 1")
+    cutoff = today - timedelta(days=lag)
+    if arguments.get("COLLECTION_END_DATE"):
+        cutoff = min(cutoff, date.fromisoformat(arguments["COLLECTION_END_DATE"]))
+    # Include the original RT period once so older predictions receive route_id.
+    # Historical-only v2 outputs before November 5 remain reusable.
+    first = date(2026, 11, 5)
+    if cutoff < first:
+        return []
+    return requested_dates({"START_DATE": str(first), "END_DATE": str(cutoff)})
+
+
 def main():
     # Resolve only the parameters required by the selected mode. Glue also
     # supplies unrelated system arguments, which getResolvedOptions ignores.
     parameters = ["JOB_NAME", "DATA_BUCKET"]
-    if "--START_DATE" in sys.argv:
+    weekly_requested = "--WEEKLY" in sys.argv
+    if weekly_requested:
+        parameters.append("WEEKLY")
+        for name in ("LAG_DAYS", "COLLECTION_END_DATE"):
+            if f"--{name}" in sys.argv:
+                parameters.append(name)
+    elif "--START_DATE" in sys.argv:
         parameters += ["START_DATE", "END_DATE"]
     else:
         parameters += ["SERVICE_DATE"]
     # SOURCE_MODE is optional. Existing jobs retain combined-source behavior.
     if "--SOURCE_MODE" in sys.argv:
         parameters.append("SOURCE_MODE")
+    if "--CHECK_ONLY" in sys.argv:
+        parameters.append("CHECK_ONLY")
     arguments = getResolvedOptions(sys.argv, parameters)
     source_mode = arguments.get("SOURCE_MODE", "both")
     if source_mode not in ("both", "istdaten"):
         raise ValueError("SOURCE_MODE must be both or istdaten")
     bucket = arguments["DATA_BUCKET"]
+    if weekly_requested:
+        if arguments["WEEKLY"].lower() != "true":
+            raise ValueError("Omit WEEKLY for fixed-date mode, or set WEEKLY=true")
+        if source_mode != "both":
+            raise ValueError("Weekly mode requires SOURCE_MODE=both")
+        days = weekly_dates(arguments)
+        if not days:
+            raise ValueError("Weekly cutoff precedes the analysis start date")
+    else:
+        days = requested_dates(arguments)
+    check_only = arguments.get("CHECK_ONLY", "false").lower()
+    if check_only not in ("true", "false"):
+        raise ValueError("CHECK_ONLY must be true or false")
+    if check_only == "true":
+        check_source_coverage(bucket, days)
+        return
     # Resume by skipping successful dates under the current rule version.
     # Completed dates remain published if a later date fails.
     done = completed_dates(boto3.client("s3"), bucket, source_mode)
+    deferred = []
+    if weekly_requested:
+        coverage = check_source_coverage(bucket, days)
+        eligible = []
+        for record in coverage["dates"]:
+            day = date.fromisoformat(record["service_date"])
+            # Original November 5–15 dates were approved with documented
+            # weather limitations. Rebuild those for route propagation.
+            reasons = weekly_eligibility(record) if day > date(2026, 11, 15) else []
+            if reasons:
+                deferred.append({"service_date": str(day), "reasons": reasons})
+            else:
+                eligible.append(day)
+        days = eligible
+        print(json.dumps({"status": "weekly_plan", "eligible_dates": len(days),
+                          "deferred_dates": deferred}))
     results = []
     # References and ERA5 windows are small enough to reuse across dates.
     # A 14-day window is loaded once while that group of dates is processed.
     batch_cache = {"keys": {}, "frames": {}}
-    for day in requested_dates(arguments):
+    if weekly_requested:
+        batch_cache["validated_rt_keys"] = coverage["validated_candidate_files"]
+    for day in days:
         if day in done:
             print(json.dumps({"service_date": day.isoformat(), "status": "already_complete"}))
             continue
@@ -578,9 +893,28 @@ def main():
             batch_cache["frames"].pop(key).unpersist()
     for frame in batch_cache["frames"].values():
         frame.unpersist()
+    if weekly_requested:
+        # This completion record connects the weekly Gold run to its audit.
+        # Deferred dates are explicit and remain eligible for a future run.
+        # Publish only after every planned Gold date has completed or resumed.
+        completion = {
+            "status": "success",
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "rule_version": RULE_VERSION,
+            "cutoff": str(weekly_dates(arguments)[-1]),
+            "coverage_report_key": coverage["report_key"],
+            "eligible_dates": [str(day) for day in days],
+            "deferred_dates": deferred,
+        }
+        boto3.client("s3").put_object(
+            Bucket=bucket, Key="quality/stop_event_analysis_coverage/weekly_refresh.json",
+            ContentType="application/json",
+            Body=json.dumps(completion, indent=2).encode("utf-8"),
+        )
     print(json.dumps({
         "status": "batch_complete",
         "processed_dates": sum(item["status"] == "success" for item in results),
+        "deferred_dates": deferred,
         "missing_silver_dates": [item["service_date"] for item in results
                                  if item["status"] == "missing_silver_istdaten"],
     }))

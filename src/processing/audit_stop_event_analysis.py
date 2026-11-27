@@ -4,6 +4,16 @@ Run as a Glue Spark script with --DATA_BUCKET datavault-v2, or locally
 with Python and boto3 using --DATA_BUCKET datavault-v2.
 This script reads small JSON reports and lists event objects. It does not
 start ETL jobs or scan transport Parquet rows.
+
+Weekly refresh configuration
+Set --WEEKLY true after a successful weekly Gold run. The audit reads the
+Gold completion record, uses its moving cutoff, and documents deferred dates.
+Historical v2 snapshots are accepted before the GTFS-RT study begins. GTFS-RT
+dates require route-aware v3 reports and validated route coverage.
+A passed audit publishes an immutable manifest and updates latest_approved.json.
+A failed audit preserves the previous approved pointer and fails the Glue job.
+Consumers should resolve the pointer and read the manifest's exact paths with
+Parquet schema merging enabled because historical snapshots lack route_id.
 """
 import argparse
 from collections import defaultdict
@@ -20,6 +30,7 @@ FIRST_DATE = date(2025, 11, 9)
 LAST_DATE = date(2026, 11, 15)
 HISTORICAL_END = date(2026, 11, 8)
 KNOWN_MISSING = date(2026, 10, 19)
+ROUTE_RULE_VERSION = "gold-events-v3-route"
 
 
 def expected_sources(day):
@@ -32,12 +43,25 @@ def expected_sources(day):
 
 def report_problem(report, key, bucket):
     """Validate completion, source counts, output location and quality fields."""
-    if report.get("status") != "success" or report.get("rule_version") != RULE_VERSION:
-        return "earlier_rules_or_incomplete"
+    # Historical v2 outputs remain valid. Dates requiring GTFS-RT must
+    # use the route-aware event schema before joining the approved snapshot.
+    if report.get("status") != "success":
+        return "incomplete"
+    if report.get("rule_version") not in (RULE_VERSION, ROUTE_RULE_VERSION):
+        return "unsupported_rules"
     try:
         day = date.fromisoformat(report["service_date"])
     except (KeyError, ValueError, TypeError):
         return "invalid_service_date"
+    if day >= date(2026, 11, 5):
+        if report.get("rule_version") != ROUTE_RULE_VERSION:
+            return "route_upgrade_required"
+        validation = report.get("route_validation", {})
+        if validation.get("silver_selected_prediction_mismatches") != 0:
+            return "route_selection_not_validated"
+        rt = report.get("by_source", {}).get("gtfs_rt", {})
+        if rt.get("gold_events", 0) and rt.get("route_id_present_events") != rt["gold_events"]:
+            return "missing_gtfs_route_identifiers"
     prefix = f"{ROOT}service_date={day}/"
     if not key.startswith(prefix):
         return "report_date_differs_from_folder"
@@ -58,9 +82,11 @@ def report_problem(report, key, bucket):
     return None
 
 
-def audit(s3, bucket):
+def audit(s3, bucket, last_date=LAST_DATE, deferred_dates=None):
     # List every Parquet and report once. Their keys also let us confirm that
     # each selected successful report points to at least one nonempty object.
+    deferred_dates = deferred_dates or []
+    deferred = {item["service_date"] for item in deferred_dates}
     objects = {}
     pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=ROOT)
     for page in pages:
@@ -89,9 +115,9 @@ def audit(s3, bucket):
 
     selected, missing, incomplete = [], [], []
     totals = defaultdict(lambda: {"gold_events": 0, "weighted_matches": defaultdict(float)})
-    for offset in range((LAST_DATE - FIRST_DATE).days + 1):
+    for offset in range((last_date - FIRST_DATE).days + 1):
         day = FIRST_DATE + timedelta(days=offset)
-        if day == KNOWN_MISSING:
+        if day == KNOWN_MISSING or day.isoformat() in deferred:
             continue
         required = expected_sources(day)
         # Prefer the latest report containing all sources required for the date.
@@ -110,6 +136,7 @@ def audit(s3, bucket):
             "output": report["output"],
             "report": f"s3://{bucket}/{key}",
             "parquet_parts": part_count,
+            "event_rule_version": report["rule_version"],
             "by_source": report["by_source"],
         })
         for source, summary in report["by_source"].items():
@@ -135,6 +162,9 @@ def audit(s3, bucket):
     result = {
         "status": "passed" if not missing and not incomplete and historical_dates == 364 else "needs_review",
         "rule_version": RULE_VERSION,
+        "gtfs_event_rule_version": ROUTE_RULE_VERSION,
+        "requested_cutoff": str(last_date),
+        "deferred_dates": deferred_dates,
         "historical_date_range": [str(FIRST_DATE), str(HISTORICAL_END)],
         "expected_historical_dates": 364,
         "verified_historical_dates": historical_dates,
@@ -157,6 +187,10 @@ def audit(s3, bucket):
         "status": result["status"],
         "rule_version": RULE_VERSION,
         "inputs": selected,
+        "gtfs_event_rule_version": ROUTE_RULE_VERSION,
+        "requested_cutoff": str(last_date),
+        "deferred_dates": deferred_dates,
+        "read_options": {"mergeSchema": True},
         "coverage_notes": result["coverage_notes"],
     }
     return result, manifest
@@ -166,13 +200,36 @@ def main():
     # Glue passes unrelated system options. Resolve just DATA_BUCKET there.
     if "--JOB_NAME" in sys.argv:
         from awsglue.utils import getResolvedOptions
-        bucket = getResolvedOptions(sys.argv, ["DATA_BUCKET"])["DATA_BUCKET"]
+        names = ["DATA_BUCKET"] + (["WEEKLY"] if "--WEEKLY" in sys.argv else [])
+        arguments = getResolvedOptions(sys.argv, names)
+        bucket = arguments["DATA_BUCKET"]
+        weekly = arguments.get("WEEKLY", "false").lower() == "true"
     else:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--DATA_BUCKET", required=True)
-        bucket = parser.parse_args().DATA_BUCKET
+        parser.add_argument("--WEEKLY", choices=("true", "false"), default="false")
+        arguments = parser.parse_args()
+        bucket = arguments.DATA_BUCKET
+        weekly = arguments.WEEKLY == "true"
     s3 = boto3.client("s3")
-    result, manifest = audit(s3, bucket)
+    cutoff = LAST_DATE
+    deferred = []
+    refresh = None
+    if weekly:
+        # Gold publishes this record only after its weekly work succeeds.
+        # Follow its cutoff and deferrals to keep the manifest reproducible.
+        with s3.get_object(
+            Bucket=bucket, Key="quality/stop_event_analysis_coverage/weekly_refresh.json"
+        )["Body"] as body:
+            refresh = json.load(body)
+        if refresh.get("status") != "success" or refresh.get("rule_version") != ROUTE_RULE_VERSION:
+            raise ValueError("Weekly Gold refresh is missing or incompatible")
+        cutoff = date.fromisoformat(refresh["cutoff"])
+        deferred = refresh["deferred_dates"]
+    result, manifest = audit(s3, bucket, cutoff, deferred)
+    if refresh:
+        result["weekly_refresh"] = refresh
+        manifest["coverage_report"] = f"s3://{bucket}/{refresh['coverage_report_key']}"
     # Every audit gets its own folder. A needs_review manifest is clearly
     # labeled, allowing unresolved coverage to be reviewed before handoff.
     prefix = f"quality/stop_event_analysis_audit/run_id={uuid4().hex}/"
@@ -180,6 +237,20 @@ def main():
         s3.put_object(Bucket=bucket, Key=prefix + filename,
                       Body=json.dumps(payload, indent=2).encode(),
                       ContentType="application/json")
+    # Keep an immutable approved manifest plus a stable pointer for consumers.
+    # Failed audits leave the previous approved pointer in place.
+    if result["status"] == "passed":
+        pointer = {
+            "status": "passed",
+            "input_manifest": f"s3://{bucket}/{prefix}input_manifest.json",
+            "audit_report": f"s3://{bucket}/{prefix}report.json",
+            "requested_cutoff": str(cutoff),
+            "deferred_dates": deferred,
+        }
+        s3.put_object(
+            Bucket=bucket, Key="quality/stop_event_analysis_audit/latest_approved.json",
+            ContentType="application/json", Body=json.dumps(pointer, indent=2).encode(),
+        )
     print(json.dumps({
         **{key: result[key] for key in (
             "status", "verified_historical_dates", "selected_dates_total",
@@ -187,6 +258,8 @@ def main():
         "audit_report": f"s3://{bucket}/{prefix}report.json",
         "input_manifest": f"s3://{bucket}/{prefix}input_manifest.json",
     }, indent=2))
+    if result["status"] != "passed":
+        raise RuntimeError("Gold audit needs review; previous approved manifest retained")
 
 
 if __name__ == "__main__":
